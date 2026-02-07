@@ -24,11 +24,13 @@ secrets to the page context or returning sensitive data.
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 import json
+import urllib.parse
 
 from util_classes import _result_error, _result_ok, ToolSpec, ToolDefinition
 from YoutubeController import PlaywrightController
 
 from tools_youtube import youtube_tools
+from tools_weather import weather_tools
 
 try:
 	from playwright.sync_api import sync_playwright, Page, Browser
@@ -223,6 +225,189 @@ def tool_find_element(_controller: PlaywrightController, args: Dict[str, Any]) -
 		return _result_error(e)
 
 
+def tool_open_website_name(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Search for a website by name using Google and open the first result.
+
+	Tries Google first; falls back to DuckDuckGo.
+	"""
+	name = args.get("name") or args.get("query")
+	if not name:
+		return _result_error("'name' or 'query' parameter is required")
+	try:
+		if _controller.page is None:
+			_controller.start(headless=False)
+		page = _controller.page
+		if page is None:
+			return _result_error("failed to start browser")
+
+		q = urllib.parse.quote_plus(str(name))
+		# Try Google first
+		search_url = f"https://www.google.com/search?q={q}"
+		page.goto(search_url, timeout=args.get("timeout", 15000))
+		href = None
+		try:
+			# common Google result selector
+			page.wait_for_selector("div#search a", timeout=6000)
+			href = page.evaluate("() => { const a = document.querySelector('div#search a'); return a ? a.href : null }")
+		except Exception:
+			href = None
+
+		if not href:
+			# fallback to DuckDuckGo
+			dd_url = f"https://duckduckgo.com/?q={q}"
+			page.goto(dd_url, timeout=args.get("timeout", 15000))
+			try:
+				page.wait_for_selector("a.result__a", timeout=6000)
+				href = page.evaluate("() => { const a = document.querySelector('a.result__a'); return a ? a.href : null }")
+			except Exception:
+				href = page.evaluate("() => { const r = document.querySelector('div#links a'); return r ? r.href : null }")
+
+		if not href:
+			return _result_error("no search result found")
+
+		# Navigate directly to the top result
+		page.goto(href, timeout=args.get("timeout", 15000))
+		return _result_ok({"status": "opened", "name": name, "url": href})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_click_by_name(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Click the first visible element whose text contains the query (case-insensitive)."""
+	query = args.get("query") or args.get("name") or args.get("text")
+	if not query:
+		return _result_error("'query' parameter is required")
+	try:
+		page = _controller.page
+		if page is None:
+			# start a headed browser if none
+			_controller.start(headless=False)
+		page = _controller.page
+		if page is None:
+			return _result_error("failed to start browser")
+
+		script = """
+		(q) => {
+			const nodes = Array.from(document.querySelectorAll('body *'));
+			q = String(q).toLowerCase().trim();
+			for (const el of nodes) {
+				try {
+					const text = (el.innerText || '').toLowerCase().trim();
+					if (!text) continue;
+					if (text.includes(q)) {
+						const rect = el.getBoundingClientRect();
+						if (rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.right >= 0) {
+							el.scrollIntoView({block: 'center', inline: 'center'});
+							el.click();
+							return {clicked: true, tag: el.tagName.toLowerCase(), text: el.innerText.slice(0,200)};
+						}
+					}
+				} catch(e) { continue; }
+			}
+			return {clicked: false};
+		}
+		"""
+		res = page.evaluate(script, query)
+		if res and res.get("clicked"):
+			return _result_ok({"status": "clicked", "tag": res.get("tag"), "text": res.get("text")})
+		else:
+			return _result_ok({"status": "not_found", "query": query})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_close_webpage(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Close the current browser tab (page)."""
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("no open page to close")
+		try:
+			page.close()
+		except Exception:
+			pass
+		# clear reference
+		_controller.page = None
+		return _result_ok({"status": "closed"})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_go_back(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("browser not started")
+		res = page.go_back()
+		return _result_ok({"status": "navigated_back", "response": bool(res)})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_go_forward(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("browser not started")
+		res = page.go_forward()
+		return _result_ok({"status": "navigated_forward", "response": bool(res)})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_reload(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("browser not started")
+		page.reload()
+		return _result_ok({"status": "reloaded", "url": page.url})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_quit(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	try:
+		_controller.stop()
+		return _result_ok({"status": "quit"})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_shrink(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Shrink the viewport/window to a smaller size (defaults to 800x600)."""
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("browser not started")
+		w = int(args.get("width", 800))
+		h = int(args.get("height", 600))
+		try:
+			page.set_viewport_size({"width": w, "height": h})
+		except Exception:
+			# fallback: resize via evaluate (best-effort)
+			page.evaluate(f"() => {{ window.resizeTo({w}, {h}); }}")
+		return _result_ok({"status": "shrank", "width": w, "height": h})
+	except Exception as e:
+		return _result_error(e)
+
+
+def tool_fullscreen(_controller: PlaywrightController, args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Request fullscreen for the document element (toggles browser fullscreen)."""
+	try:
+		page = _controller.page
+		if page is None:
+			return _result_error("browser not started")
+		res = page.evaluate(
+			"() => { try { const el = document.documentElement; if (!document.fullscreenElement) { el.requestFullscreen(); return true; } else { document.exitFullscreen(); return true; } } catch(e) { return false; } }"
+		)
+		if res:
+			return _result_ok({"status": "fullscreen_toggled"})
+		return _result_error("failed to toggle fullscreen")
+	except Exception as e:
+		return _result_error(e)
+
+
 # ============================================================================
 # TOOL REGISTRY: Build the _TOOLS dict from core and modular tools
 # ============================================================================
@@ -231,17 +416,26 @@ _CORE_TOOLS = {
 	"start_browser": tool_start_browser,
 	"goto": tool_goto,
 	"click": tool_click,
+	"click_by_name": tool_click_by_name,
 	"fill": tool_fill,
 	"screenshot": tool_screenshot,
 	"eval": tool_eval,
 	"text_content": tool_text_content,
 	"close_browser": tool_close_browser,
 	"find_element": tool_find_element,
+	"open_website_name": tool_open_website_name,
+	"close_webpage": tool_close_webpage,
+	"go_back": tool_go_back,
+	"go_forward": tool_go_forward,
+	"reload": tool_reload,
+	"quit": tool_quit,
+	"shrink": tool_shrink,
+	"fullscreen": tool_fullscreen,
 }
 
 # Register modular tools (YouTube, Spotify, etc.)
 _MODULAR_TOOLS = {}
-for tool_def in youtube_tools:
+for tool_def in youtube_tools + weather_tools:
 	_MODULAR_TOOLS[tool_def.name] = tool_def.func
 
 _TOOLS: Dict[str, Callable[[PlaywrightController, Dict[str, Any]], Dict[str, Any]]] = {**_CORE_TOOLS, **_MODULAR_TOOLS}
@@ -297,6 +491,51 @@ _CORE_TOOL_SPECS = {
 		description="Heuristically find an element by a human query. Args: query (string).",
 		parameters={"type": "object", "properties": {"query": {"type": "string"}}},
 	),
+	"open_website_name": ToolSpec(
+		name="open_website_name",
+		description="Search for a website by name and open first result.",
+		parameters={"type": "object", "properties": {"name": {"type": "string"}, "query": {"type": "string"}}},
+	),
+	"click_by_name": ToolSpec(
+		name="click_by_name",
+		description="Click the first visible element whose text contains the query (case-insensitive).",
+		parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+	),
+	"close_webpage": ToolSpec(
+		name="close_webpage",
+		description="Close the current browser tab.",
+		parameters={"type": "object", "properties": {}},
+	),
+	"go_back": ToolSpec(
+		name="go_back",
+		description="Navigate back in browser history.",
+		parameters={"type": "object", "properties": {}},
+	),
+	"go_forward": ToolSpec(
+		name="go_forward",
+		description="Navigate forward in browser history.",
+		parameters={"type": "object", "properties": {}},
+	),
+	"reload": ToolSpec(
+		name="reload",
+		description="Reload the current page.",
+		parameters={"type": "object", "properties": {}},
+	),
+	"quit": ToolSpec(
+		name="quit",
+		description="Quit the browser process.",
+		parameters={"type": "object", "properties": {}},
+	),
+	"shrink": ToolSpec(
+		name="shrink",
+		description="Shrink the browser viewport/window.",
+		parameters={"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}},
+	),
+	"fullscreen": ToolSpec(
+		name="fullscreen",
+		description="Toggle fullscreen for the page document.",
+		parameters={"type": "object", "properties": {}},
+	),
 }
 
 
@@ -312,8 +551,8 @@ def get_tool_specs() -> Dict[str, Any]:
 	for name, spec in _CORE_TOOL_SPECS.items():
 		specs[name] = {"description": spec.description, "parameters": spec.parameters}
 	
-	# Add modular tool specs (from YouTube, Spotify, etc.)
-	for tool_def in youtube_tools:
+	# Add modular tool specs (from YouTube, Weather, etc.)
+	for tool_def in youtube_tools + weather_tools:
 		specs[tool_def.name] = {
 			"description": tool_def.spec.description,
 			"parameters": tool_def.spec.parameters,
@@ -345,8 +584,7 @@ if __name__ == "__main__":
 	# Example: start a headed browser
 	seq = [
 		("start_browser", {"headless": False}),
-		("yt_watch", {"query": "how to cook filet mignon"}),
-		("yt_pause_play", {})
+		("curr_weather_location", {"location": "Chatham"}),
 		#("start_browser", {"headless": False}),
 		#("search_youtube", {"query": "Bob Ross"}),
 		#("close_browser", {}),
@@ -356,7 +594,4 @@ if __name__ == "__main__":
 		print(f"Executing: {name}")
 		result = execute_tool(name, args)
 		print(f"Result: {json.dumps(result, indent=2)}\n")
-
-	input()
-
 
